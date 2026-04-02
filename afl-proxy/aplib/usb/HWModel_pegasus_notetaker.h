@@ -87,7 +87,7 @@ public:
   virtual ~HWModel_pegasus_notetaker(){};
   virtual void restart_device() final { probe_len = 0; };
   virtual int read(uint8_t *dest, uint64_t addr, size_t size) final {
-    uint8_t *ptr = &(device_ram[addr]);
+    uint8_t *ptr = &(device_ram[addr % sizeof(device_ram)]);
     switch (size) {
     case (1):
       *((uint8_t *)dest) = *(uint8_t *)(ptr);
@@ -99,15 +99,16 @@ public:
       *((uint32_t *)dest) = *(uint32_t *)(ptr);
       break;
     case (8):
-      *((uint64_t *)ptr) = *(uint64_t *)(ptr);
+      *((uint64_t *)dest) = *(uint64_t *)(ptr);
       break;
     default:
-      assert(0);
+      /* USB bulk/interrupt transfers can be arbitrary sizes */
+      memcpy(dest, ptr, size);
     }
     return size;
   };
   virtual void write(uint64_t data, uint64_t addr, size_t size) final {
-    uint8_t *ptr = &device_ram[addr];
+    uint8_t *ptr = &device_ram[addr % sizeof(device_ram)];
     switch (size) {
     case (1):
       *ptr = (uint8_t)((data)&0xff);
@@ -122,7 +123,7 @@ public:
       *((uint64_t *)ptr) = (uint64_t)(data);
       break;
     default:
-      assert(0);
+      break;
     }
   };
 
@@ -140,3 +141,24 @@ private:
 #undef STRING_PRODUCT
 #undef STRING_SERIALNUMBER
 #undef STRING_CONTROL
+// USB Protocol Model for pegasus_notetaker
+// Auto-extracted by generate_usb_model.py from LLVM bitcode
+// Completion handlers: pegasus_irq
+// Constraints: buf[1]==0xb5 (marker), buf[2,4]==0 (position), URB status codes
+Stage2HWModel * new_stage2_model_pegasus_notetaker() {
+  unordered_map<int, HWInput> mmio_mdl = {};
+  vector<DMAInputModel> dma_mdl = {};
+  auto * model = new Stage2HWModel("pegasus_notetaker", mmio_mdl, dma_mdl);
+
+  // USB buffer protocol model (auto-extracted from driver bitcode)
+  unordered_map<int, HWInput> usb_mdl =
+  {
+    {1 , HWInput(1, 1, {}, {0xb5}, {})},
+    {2 , HWInput(2, 2, {}, {0x0}, {})},
+    {4 , HWInput(4, 2, {}, {0x0}, {})},
+    {88 , HWInput(88, 4, {}, {0x0, 0xffffff94, 0xffffff98, 0xfffffffe}, {})},
+  };
+  model->setUSBModel(usb_mdl);
+
+  return model;
+}

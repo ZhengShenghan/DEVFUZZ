@@ -38,6 +38,7 @@ struct XXX {
 };
 
 AFLClient *aflClient;
+volatile int pt_stop = 0;
 
 // inject coverage information to AFL
 void inject_cov(uint64_t addr) { aflClient->AFLMaybeLog(addr); }
@@ -53,6 +54,7 @@ void start_pt(struct XXX *sm, int core_id) {
   pid_t tid;
   memcpy(&tid, &(sm->data), sizeof(pid_t));
   LOG_TO_FILE("afl.log", "start PT for tid..." << tid);
+  pt_stop = 0; // reset stop flag for new PT thread
   aflClient->startPT(core_id);
 }
 
@@ -137,5 +139,8 @@ int main(int argc, char **argv) {
   }
   shm.close();
   shm_unlink(shmname.c_str());
+  // Signal PT thread to stop and wait briefly for it to exit
+  pt_stop = 1;
+  usleep(10000); // 10ms for PT thread to exit its loop
   return 0;
 }

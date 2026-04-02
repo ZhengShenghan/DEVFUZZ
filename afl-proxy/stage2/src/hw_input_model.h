@@ -28,6 +28,7 @@ public:
   
   inline int nbytes() { return n_bytes; }
   bool empty() { return bits_set.empty() && value_set.empty() && ranges.empty(); }
+  int numConstraints() { return bits_set.size() + value_set.size() + ranges.size(); }
   void setOffset(int off) { offset = off; }
   void setSize(int nbytes) { n_bytes = nbytes; }
   inline void insertRanges(int64_t start, int64_t end) { ranges.push_back({start, end}); }

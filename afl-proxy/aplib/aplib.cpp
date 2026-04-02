@@ -150,7 +150,7 @@ void watch_dog() {
   while (1) {
     auto cur_time = chrono::steady_clock::now();
     auto elapsed_secs = chrono::duration_cast<chrono::seconds>(cur_time - afl_last_epoch_end).count();
-    if (elapsed_secs > 60) {
+    if (elapsed_secs > 600) { // 10 min timeout (was 60s)
       exit(0);
     }
     sleep(5);
@@ -323,9 +323,14 @@ int ap_get_fuzz_data(uint8_t *dest, uint64_t addr, size_t size, int bar) {
         last_dev_restart = cur_time;
       }
       get_hw_instance()->read((uint8_t*)&probe_mdl_input, addr, size, bar);
-      if (yes(model_mutate_prob) && fuzzdatasize) { //&& get_hw_instance()->getRestartCnt() > 0) {
+      if (yes(model_mutate_prob) && fuzzdatasize) {
         wrapped_addr = addr % fuzzdatasize;
-        memcpy(dest, fuzzdata + wrapped_addr, size);
+        // If stage2 has USB model, use it to overlay protocol-aware values
+        if (stage2 && stage2->hasUSBModel()) {
+          stage2->feedFuzzUSBData(dest, size, fuzzdata + wrapped_addr, fuzzdatasize - wrapped_addr);
+        } else {
+          memcpy(dest, fuzzdata + wrapped_addr, size);
+        }
       } else {
         // use symbolic model
         memcpy(dest, &probe_mdl_input, size);
@@ -364,7 +369,11 @@ int ap_get_fuzz_data(uint8_t *dest, uint64_t addr, size_t size, int bar) {
     goto end;
   
   if (stage2 && use_stage2 && delay_counter > model_delay) {
-    stage2->feedFuzzMMIOData(addr, dest, size, (fuzzdata + wrapped_addr));
+    if (stage2->hasUSBModel()) {
+      stage2->feedFuzzUSBData(dest, size, fuzzdata + wrapped_addr, fuzzdatasize - wrapped_addr);
+    } else {
+      stage2->feedFuzzMMIOData(addr, dest, size, (fuzzdata + wrapped_addr));
+    }
   } else if (addr + size <= fuzzdatasize) {
     memcpy(dest, fuzzdata + wrapped_addr, size);
   } else {

@@ -158,6 +158,144 @@ sudo python3 <PROJ_ROOT>/tools/generate_postprobing_model.py --file <HWMODEL_xxx
 ### Insert Model into the Database
 go to **afl-proxy/aplib/hw_model.cpp** to register the devide model. Examples can be found in this file.
 
+## USB Device Fuzzing
+
+USB device models are in **afl-proxy/aplib/usb/**. The USB fuzzing path uses the same AFL + QEMU architecture as PCI, but with different QEMU device (`usb-sfp` instead of `sfp`).
+
+### Prerequisites
+```bash
+# Intel PT requires relaxed perf permissions
+echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
+
+# Kill any stale proxy processes (they hold PT resources)
+sudo pkill -9 -f "afl-fuzz|qemu-system|ap "
+
+# Ensure the guest image has the USB probe script
+# The script reads the driver name from kernel cmdline: usb_driver=<name>
+```
+
+### Prepare Guest Image
+The guest `.bashrc` should run `./usb-probe.sh` which reads the driver name from the kernel command line parameter `usb_driver=`:
+```bash
+cat tools/test_scripts/usb-probe.sh
+# #!/bin/bash
+# name=$(cat /proc/cmdline | grep -oP 'usb_driver=\K\S+' || echo "ims_pcu")
+# echo "USB Probing: $name"
+# while [ true ]; do rmmod $name 2>/dev/null; sleep 2; modprobe $name; dmesg | tail -5; done
+
+./tools/shell_scripts/transfer-to-img.sh tools/test_scripts/usb-probe.sh
+echo "./usb-probe.sh" > .bashrc
+./tools/shell_scripts/transfer-to-img.sh .bashrc
+```
+
+### Running USB Probing Fuzzing (Manual)
+Unlike PCI fuzzing which uses `tools/fuzz_probe.py`, USB fuzzing currently requires direct QEMU invocation due to differences in the SFP device setup.
+
+**Terminal 1 - Launch AFL:**
+```bash
+cd run-<device>-probe && echo > afl.log
+sudo AFL_SKIP_CPUFREQ=1 AFL_NO_AFFINITY=1 \
+  AFL/afl-fuzz -t 500000000+ -m 256 \
+  -i tools/seed -o out -d -f seed \
+  afl-proxy/proxy/build/ap @@ <CORE> <SHMID>
+```
+
+**Terminal 2 - Launch QEMU:**
+```bash
+sudo SFP_SHMID=<SHMID> AP_DISABLED=0 TEST_PROBE=1 \
+  USE_DMA=0 USE_IRQ=0 USE_STAGE2=0 \
+  SFP_DEV_MODEL=<DEVICE> AFL_EPOCH=5 \
+  WAITGDB=0 EXPORT_DEVMEM=0 \
+  MODEL_PROBE_FUZZ=1 MODEL_RESET_TIME=1 MODEL_MUTATE_PROB=50 \
+  AP_DUMP_RW=0 \
+  taskset -c <CORE> \
+  build-qemu-exp/x86_64-softmmu/qemu-system-x86_64 \
+  -machine q35,accel=kvm -m 2G -smp 1 \
+  -kernel images/bzImage-master \
+  -append "nokaslr nosoftlockup console=ttyS0 root=/dev/vda \
+    earlyprintk=serial biosdevname=0 net.ifnames=0 loglevel=8 \
+    security=none ro rootfstype=ext4 mitigations=off \
+    cryptomgr.notests clocksource=tsc audit=0 parport=0 \
+    kmemleak=on nosmp usb_driver=<DEVICE>" \
+  -drive file=images/stretch.img,if=virtio,format=raw -snapshot \
+  -net none -usb -device usb-sfp \
+  -nographic -serial file:vm-testing-<SHMID>.log
+```
+
+**Example (ims_pcu on core 0, SHMID 0):**
+```bash
+# Terminal 1
+cd run-ims_pcu-probe && echo > afl.log
+sudo AFL_SKIP_CPUFREQ=1 AFL_NO_AFFINITY=1 \
+  AFL/afl-fuzz -t 500000000+ -m 256 -i tools/seed -o out -d -f seed \
+  afl-proxy/proxy/build/ap @@ 0 0
+
+# Terminal 2
+sudo SFP_SHMID=0 AP_DISABLED=0 TEST_PROBE=1 USE_DMA=0 USE_IRQ=0 USE_STAGE2=0 \
+  SFP_DEV_MODEL=ims_pcu AFL_EPOCH=5 WAITGDB=0 EXPORT_DEVMEM=0 \
+  MODEL_PROBE_FUZZ=1 MODEL_RESET_TIME=1 MODEL_MUTATE_PROB=50 AP_DUMP_RW=0 \
+  taskset -c 0 build-qemu-exp/x86_64-softmmu/qemu-system-x86_64 \
+  -machine q35,accel=kvm -m 2G -smp 1 \
+  -kernel images/bzImage-master \
+  -append "nokaslr nosoftlockup console=ttyS0 root=/dev/vda earlyprintk=serial \
+    biosdevname=0 net.ifnames=0 loglevel=8 security=none ro rootfstype=ext4 \
+    mitigations=off cryptomgr.notests clocksource=tsc audit=0 parport=0 \
+    kmemleak=on nosmp usb_driver=ims_pcu" \
+  -drive file=images/stretch.img,if=virtio,format=raw -snapshot \
+  -net none -usb -device usb-sfp -nographic -serial file:vm-testing-0.log
+```
+
+### Monitoring & Resume
+```bash
+# Quick status
+sudo bash check-status.sh
+
+# Resume experiment if it dies (keeps AFL queue + gcov data)
+sudo bash run-48h.sh resume
+```
+
+### Coverage Analysis & Plotting
+gcov data is dumped every ~2 minutes by the guest VM into `share-*/gcov/`.
+Each run's dumps are stored in a separate subdirectory (e.g., `run_01_old/`, `run_02_current/`).
+
+```bash
+# List available runs
+sudo python3 analyze-coverage.py --list
+
+# Plot latest run (default)
+sudo python3 analyze-coverage.py
+
+# Plot a specific old run
+sudo python3 analyze-coverage.py --run run_01_old
+
+# Plot all runs side by side
+sudo python3 analyze-coverage.py --run all --output coverage-all-runs.png
+
+# Text-only report
+sudo python3 analyze-coverage.py --text
+```
+
+Results are cached in `share-*/gcov/<run>/trend_cache.json` so re-plotting is fast.
+
+The plot shows 3 columns per driver:
+1. **Coverage over time** - line coverage, branch executed, branch taken (%)
+2. **Branch depth** - branches taken/executed/not-executed at each nesting depth
+3. **Line depth** - lines covered/uncovered at each nesting depth
+
+### Supported USB Devices
+| Device | VID:PID | Driver | gcov Coverage |
+|--------|---------|--------|---------------|
+| IMS PCU | 04d8:0082 | ims_pcu | 31.2% line, 45% branch |
+| Pegasus Notetaker | 0e20:0101 | pegasus_notetaker | 72.2% line, 84% branch |
+
+### Key Differences from PCI Fuzzing
+- Uses `-usb -device usb-sfp` instead of `-device sfp`
+- No IOMMU needed (remove `-device intel-iommu`)
+- Coverage via Intel PT (same as PCI)
+- `AFL_EPOCH=5` recommended for probing (5 seconds per epoch)
+- USB models have no MMIO/DMA stage2 models (empty by design)
+- The QEMU SFP USB device uses the model's USB descriptors for proper driver matching
+
 ## Collect Code Coverage
 We use gcov to collect code coverage. Please refer to [linux-gcov](https://github.com/yiluwusbu/DEVFUZZ/tree/master/afl-proxy/linux-gcov) for details.
 

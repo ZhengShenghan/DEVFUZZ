@@ -185,11 +185,17 @@ public:
     // this is handled by aplib.cpp
     if (redirectR)
       return 0;
-    // otherwise fallback to reading out device mem(bar)
-    return bars[bar]->read(dest, addr, size);
+    // otherwise fallback to reading out device mem(bar) for PCI devices
+    if (bar >= 0 && (size_t)bar < bars.size())
+      return bars[bar]->read(dest, addr, size);
+    return 0;
   };
   virtual void write(uint64_t data, uint64_t addr, size_t size, int bar) {
-    bars[bar]->write(data, addr, size);
+    // call model-specific write first (e.g., USB models)
+    write(data, addr, size);
+    // then update BAR memory if available (PCI models)
+    if (bar >= 0 && (size_t)bar < bars.size())
+      bars[bar]->write(data, addr, size);
   }
 
   const string &getName() { return name; };
@@ -480,6 +486,9 @@ public:
         mmios.second.setProb(prob);
       }
     }
+    for (auto & p : usb_inputs) {
+      p.second.setProb(prob);
+    }
   }
 
   HWInput & getMMIOInputAt(int offset) {
@@ -699,9 +708,50 @@ public:
     }
   }
   
+  // USB buffer model support
+  void setUSBModel(const unordered_map<int, HWInput> & usb_mdl) {
+    usb_inputs = usb_mdl;
+    for (auto & p : usb_inputs) {
+      p.second.genDict();
+    }
+  }
+
+  bool hasUSBModel() { return !usb_inputs.empty(); }
+
+  // Feed model-guided data for USB buffer reads
+  // dest: output buffer, afl_data: raw fuzz data, size: buffer size
+  void feedFuzzUSBData(uint8_t *dest, int size, uint8_t *afl_data, int afl_len) {
+    // Start with raw fuzz data as baseline
+    int copy_len = size < afl_len ? size : afl_len;
+    memcpy(dest, afl_data, copy_len);
+
+    // Overlay model-guided values at constrained offsets
+    for (auto & pair : usb_inputs) {
+      int offset = pair.first;
+      HWInput & hwi = pair.second;
+
+      if (offset >= size)
+        continue;
+
+      int field_sz = hwi.size();
+      if (offset + field_sz > size)
+        field_sz = size - offset;
+
+      // Get the original fuzz byte at this offset
+      uint64_t orig = 0;
+      if (offset < afl_len)
+        memcpy(&orig, &afl_data[offset % afl_len], field_sz);
+
+      // Let the model decide: use model value or keep fuzz data
+      uint64_t model_data = hwi.feedData(mode, orig);
+      memcpy(&dest[offset], &model_data, field_sz);
+    }
+  }
+
 private:
   string dev_name;
   unordered_map<int, HWInput> mmio_inputs;
+  unordered_map<int, HWInput> usb_inputs;  // USB buffer offset -> constraints
   unordered_map<int, DMAInputModel> dma_inputs; // map dma_len to input model
   unordered_map<uint64_t, int> dma_regs; // reg -> buffer size
   int dma_hi_reg=-1;

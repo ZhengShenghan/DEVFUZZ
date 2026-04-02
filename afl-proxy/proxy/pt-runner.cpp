@@ -267,16 +267,27 @@ void ptWorker(int core_id) {
 
   int group_fd = -1;
   unsigned long flags = 0;
-  LOG_TO_FILE("afl.log", "Setting up PT...!"); 
-  int fd = perf_event_open(&attr, pid, cpu, group_fd, flags);
+  LOG_TO_FILE("afl.log", "Setting up PT...!");
+  int fd = -1;
+  for (int retry = 0; retry < 50; retry++) {
+    fd = perf_event_open(&attr, pid, cpu, group_fd, flags);
+    if (fd >= 0)
+      break;
+    if (errno == EBUSY) {
+      LOG_TO_FILE("afl.log", "perf_event_open EBUSY, retrying...");
+      usleep(100000); /* 100ms */
+      continue;
+    }
+    break;
+  }
   if (fd < 0) {
-    LOG_TO_FILE("afl.log", "perf_event_open failed!");
+    LOG_TO_FILE("afl.log", "perf_event_open failed, continuing without PT");
     ERROR("Error opening leader event "
-          << hexval(attr.config) << "\n"
+          << hexval(attr.config) << " errno=" << errno << "\n"
           << "try run as root or set /proc/sys/kernel/perf_event_paranoid\n"
           << "also check /sys/devices/intel_pt/type\n"
           << "run perf record -e intel_pt// -vvv to confirm event type\n");
-    exit(EXIT_FAILURE);
+    return;
   }
  
   // LOG_TO_FILE("afl.log", "> perf fd =" << fd);
@@ -296,8 +307,9 @@ void ptWorker(int core_id) {
   }
   LOG_TO_FILE("afl.log", "PT Set up finished!");
   outs() << "====================================================\n";
-  // start to poll buffer
-  while (1) {
+  // start to poll buffer - exit when pt_stop is set
+  extern volatile int pt_stop;
+  while (!pt_stop) {
     check_buffer(fd);
     fflush(stdout);
   }

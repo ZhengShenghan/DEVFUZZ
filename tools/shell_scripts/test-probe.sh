@@ -46,7 +46,7 @@ INITRD=""
 
 ROFS="-snapshot"
 
-ROOTFS="$ROOT/images/stretch.img,format=raw ${ROFS}"
+ROOTFS="$ROOT/images/stretch.img,if=virtio,format=raw ${ROFS}"
 
 #dd if=/dev/urandom of=./sfp-rom.rom bs=1M count=1
 
@@ -57,8 +57,8 @@ ACCEL=kvm
 # LOG_LEVEL="-d exec -D /dev/null"
 
 SFP=""
-SFP="-device sfp,bus=pcie.1 "
-#SFP="-usb -device usb-sfp"
+#SFP="-device sfp,bus=pcie.1 "
+SFP="-usb -device usb-sfp"
 
 NIC="-net none"
 #NIC="-net nic,model=ne2k_pci"
@@ -66,7 +66,7 @@ NIC="-net none"
 # NIC="-netdev user,id=net0 -device e1000,netdev=net0,bus=pcie.1"
 #NIC="-netdev user,id=net0 -device virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off,iommu_platform=on,ats=on"
 
-APPEND="nokaslr console=ttyS0 root=/dev/sda earlyprintk=serial biosdevname=0 net.ifnames=0 loglevel=8 security=none ro rootfstype=ext4 mitigations=off cryptomgr.notests clocksource=tsc audit=0 parport=0 kmemleak=on nosmp intel_iommu=on iommu=pt"
+APPEND="nokaslr nosoftlockup console=ttyS0 root=/dev/vda earlyprintk=serial biosdevname=0 net.ifnames=0 loglevel=8 security=none ro rootfstype=ext4 mitigations=off cryptomgr.notests clocksource=tsc audit=0 parport=0 kmemleak=on nosmp intel_iommu=on iommu=pt"
 
 GDB=""
 #GDB="-s"
@@ -312,7 +312,7 @@ ${DIR}qemu-system-x86_64 \
   -machine q35,accel=${ACCEL},kernel-irqchip=split \
   -device intel-iommu,intremap=on,caching-mode=on,device-iotlb=on \
   -m 2G  -smp 1 \
-  ${KVM} ${GDB} ${GDBSTOP} \
+  ${KVM} ${GDB} ${GDBSTOP} ${LOG_LEVEL} \
   -device ioh3420,id=pcie.1,chassis=1 \
   ${KERNEL} ${INITRD} -append "${APPEND}"\
   -drive file=${ROOTFS} \

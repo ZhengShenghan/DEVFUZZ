@@ -14,6 +14,7 @@
 #define BIT(x) (1u << (x))
 
 #include "aflclient.h"
+#include "logutil.h"
 
 extern AFLClient *aflClient;
 
@@ -21,6 +22,8 @@ class PTDecoder {
 public:
   PTDecoder(){};
   ~PTDecoder(){};
+  uint64_t total_tips = 0;
+  uint64_t total_psbs = 0;
   void decode(uint8_t *map, size_t len) {
     uint8_t *end = &map[len];
     uint8_t *p;
@@ -33,8 +36,18 @@ public:
       /* look for PSB */
       p = (uint8_t *)memmem(p, end - p, psb, 16);
       if (!p) {
+        if (total_psbs == 0) {
+          LOG_TO_FILE("afl.log", "PT: no PSB found in " << len << " bytes, first bytes: "
+                      << std::hex << (int)map[0] << " " << (int)map[1] << " "
+                      << (int)map[2] << " " << (int)map[3]);
+        }
         p = end;
         break;
+      }
+      total_psbs++;
+      if (total_psbs <= 3) {
+        LOG_TO_FILE("afl.log", "PT: PSB found at offset " << (p - map)
+                    << " skipped=" << (p - prev));
       }
       skipped += p - prev;
       while (p < end) {
@@ -140,8 +153,11 @@ public:
           int ipl = *p >> 5;
           p++;
           auto ip = get_ip_val(&p, end, ipl, &last_ip);
-          // LOG_TO_FILE("afl.log", "ip@" << std::hex << ip);
-          // printf("%s\t%d: 0x%lx\n", name, ipl, ip);
+          if (total_tips < 5) {
+            LOG_TO_FILE("afl.log", "PT TIP: " << name << " ipl=" << ipl
+                        << " ip=0x" << std::hex << ip);
+          }
+          total_tips++;
           aflClient->AFLMaybeLog(ip);
           continue;
         }
@@ -190,7 +206,11 @@ public:
           p++;
           continue;
         }
-        // print_unknown(p, end, map);
+        if (total_tips == 0 && total_psbs <= 3) {
+          LOG_TO_FILE("afl.log", "PT: unknown packet at offset " << (p - map)
+                      << " bytes: " << std::hex << (int)p[0] << " " << (int)p[1]
+                      << " " << (int)p[2] << " " << (int)p[3]);
+        }
         break;
       }
     }
@@ -206,7 +226,13 @@ public:
 private:
   const uint8_t psb[16] = {0x02, 0x82, 0x02, 0x82, 0x02, 0x82, 0x02, 0x82,
                            0x02, 0x82, 0x02, 0x82, 0x02, 0x82, 0x02, 0x82};
-  /* Caller must have checked length */
+  /* Decode IP from PT packet based on IP Length (IPL) field.
+   * IPL 0: no IP update
+   * IPL 1: update bits 15:0 (read 2 bytes)
+   * IPL 2: update bits 31:0 (read 4 bytes)
+   * IPL 3: update bits 47:0, sign-extend (read 6 bytes)
+   * IPL 4/6: full 64-bit IP (read 8 bytes)
+   */
   uint64_t get_ip_val(unsigned char **pp, unsigned char *end, int len,
                       uint64_t *last_ip) {
     unsigned char *p = *pp;
@@ -218,9 +244,9 @@ private:
       return 0; /* out of context */
     }
     if (len < 4) {
-      if (!LEFT(len)) {
+      if (!LEFT(len * 2)) {
         *last_ip = 0;
-        return 0; /* XXX error */
+        return 0; /* truncated */
       }
       for (int i = 0; i < len; i++, shift += 16, p += 2) {
         uint64_t b = *(uint16_t *)p;
@@ -228,7 +254,13 @@ private:
       }
       v = ((int64_t)(v << (64 - 48))) >> (64 - 48); /* sign extension */
     } else {
-      return 0; /* XXX error */
+      /* IPL 4 or 6: full 64-bit IP */
+      if (!LEFT(8)) {
+        *last_ip = 0;
+        return 0; /* truncated */
+      }
+      v = *(uint64_t *)p;
+      p += 8;
     }
     *pp = p;
     *last_ip = v;

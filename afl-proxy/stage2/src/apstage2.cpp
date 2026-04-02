@@ -139,9 +139,27 @@ void APStage2::processCall(CallInst *ci) {
   }
   // map device pio/mmio region
   if (name.startswith("pci_iomap") || name.startswith("ioremap") || name.startswith("pcim_iomap_table") || name.startswith("pcim_iomap")
-      || name.startswith("pci_ioremap")) 
+      || name.startswith("pci_ioremap"))
   {
     callIoMap.push_back(ci);
+  }
+  // USB buffer operations
+  if (name.startswith("usb_submit_urb")) {
+    callUsbSubmitUrb.push_back(ci);
+  }
+  if (name.startswith("usb_bulk_msg") || name.startswith("usb_control_msg")) {
+    callUsbBulkMsg.push_back(ci);
+  }
+  if (name.startswith("usb_fill_int_urb") || name.startswith("usb_fill_bulk_urb")) {
+    callUsbFillUrb.push_back(ci);
+    // The completion handler is typically the 6th argument (index 5)
+    if (ci->arg_size() > 5) {
+      Value *handler = ci->getArgOperand(5)->stripPointerCasts();
+      if (Function *f = dyn_cast<Function>(handler)) {
+        usbCompletionHandlers.insert(f);
+        DEBUG("USB completion handler: " << f->getName().str());
+      }
+    }
   }
   // errs()<<*ci<<"\n";
 }
@@ -1876,6 +1894,25 @@ void APStage2::genStage2ModelInitCode(const std::string & model_name) {
   }
   code += "};\n";
   code += "auto * model = new Stage2HWModel(\"" + model_name + "\", mmio_mdl, dma_mdl);\n";
+
+  // USB buffer model
+  if (!usbModel.empty()) {
+    code += "\n// USB Buffer Protocol Model\n";
+    code += "// Maps buffer offset -> expected values (magic bytes, protocol constants)\n";
+    code += "unordered_map<int, HWInput> usb_mdl =\n{\n";
+    for (auto & pair : usbModel) {
+      int offset = pair.first;
+      HWInput & hwi = pair.second;
+      if (hwi.empty()) continue;
+      hwi.process();
+      auto head = "{" + std::to_string(offset) + " , ";
+      code += head + hwi.genModelInitCode(head.length());
+      code += "},\n";
+    }
+    code += "};\n";
+    code += "model->setUSBModel(usb_mdl);\n";
+  }
+
   errs() << code;
 }
 
@@ -1917,6 +1954,213 @@ void APStage2::extractDMAFieldConstraint(Value * v, TypeOffset type_offset) {
     errs() << expr->str() << "\n";
   }
   errs() << "\n";
+}
+
+///
+/// USB Buffer Analysis
+/// Finds completion handlers, traces buffer reads, extracts constraints
+///
+void APStage2::findUSBCompletionHandlers() {
+  // Also find completion handlers registered via function pointers stored
+  // to URB struct fields (e.g., urb->complete = handler)
+  for (auto &F : *m_) {
+    if (F.isDeclaration())
+      continue;
+    auto name = F.getName();
+    // Common USB completion handler naming patterns
+    if (name.contains("_irq") || name.contains("_complete") ||
+        name.contains("_callback") || name.contains("_bulk_") ||
+        name.contains("_intr_")) {
+      // Check if this function takes a struct urb* parameter
+      for (auto &arg : F.args()) {
+        Type *t = arg.getType();
+        if (t->isPointerTy()) {
+          Type *base = getPointerBaseType(t);
+          if (base->isStructTy()) {
+            StructType *st = cast<StructType>(base);
+            if (st->hasName() && st->getName().contains("urb")) {
+              usbCompletionHandlers.insert(&F);
+              DEBUG("USB completion handler (by signature): " << name.str());
+            }
+          }
+        }
+      }
+    }
+  }
+  // Also check stored function pointers to urb->complete field
+  for (auto *ci : callUsbFillUrb) {
+    // usb_fill_int_urb/usb_fill_bulk_urb pass completion handler as arg
+    // Already handled in processCall
+  }
+  errs() << "Total USB completion handlers: " << usbCompletionHandlers.size() << "\n";
+  for (auto *f : usbCompletionHandlers) {
+    errs() << "  " << f->getName().str() << "\n";
+  }
+}
+
+void APStage2::collectUSBBufferReads(Function *handler) {
+  // In USB completion handlers, the driver typically accesses:
+  //   urb->transfer_buffer[offset] or a local buffer pointer
+  // We look for GEP + Load patterns on buffers, then track
+  // comparisons against those loaded values
+
+  for (auto &BB : *handler) {
+    for (auto &I : BB) {
+      // Look for load instructions from buffer pointers
+      if (auto *load = dyn_cast<LoadInst>(&I)) {
+        Value *ptr = load->getPointerOperand()->stripPointerCasts();
+
+        // Check if loading from a GEP (array/struct access)
+        if (auto *gep = dyn_cast<GetElementPtrInst>(ptr)) {
+          int offset = getGEPOffset(gep);
+          if (offset >= 0) {
+            // This is a buffer read at a specific offset
+            usbBufferReads[load] = offset;
+          }
+        }
+      }
+
+      // Also find comparisons involving loaded values
+      // These give us the protocol constants
+      if (auto *icmp = dyn_cast<ICmpInst>(&I)) {
+        Value *op0 = icmp->getOperand(0);
+        Value *op1 = icmp->getOperand(1);
+
+        // One operand should be a constant
+        ConstantInt *constOp = nullptr;
+        Value *varOp = nullptr;
+        if (auto *c = dyn_cast<ConstantInt>(op0)) {
+          constOp = c; varOp = op1;
+        } else if (auto *c = dyn_cast<ConstantInt>(op1)) {
+          constOp = c; varOp = op0;
+        }
+        if (!constOp || !varOp)
+          continue;
+
+        // Check if the variable operand comes from a buffer read
+        varOp = varOp->stripPointerCasts();
+        if (auto *cast = dyn_cast<CastInst>(varOp)) {
+          varOp = cast->getOperand(0);
+        }
+
+        // Track this as a USB buffer constraint
+        int offset = -1;
+        if (usbBufferReads.count(varOp)) {
+          offset = usbBufferReads[varOp];
+        } else {
+          // Try to find if varOp is loaded from a struct field
+          // that we can map to a buffer offset
+          if (auto *load = dyn_cast<LoadInst>(varOp)) {
+            Value *addr = load->getPointerOperand()->stripPointerCasts();
+            if (auto *gep = dyn_cast<GetElementPtrInst>(addr)) {
+              offset = getGEPOffset(gep);
+            }
+          }
+        }
+
+        if (offset >= 0) {
+          uint64_t val = constOp->getZExtValue();
+          int nbytes = constOp->getBitWidth() / 8;
+          if (nbytes == 0) nbytes = 1;
+
+          // Add to USB model
+          if (usbModel.find(offset) == usbModel.end()) {
+            HWInput hi(offset, nbytes);
+            usbModel[offset] = hi;
+          }
+
+          auto pred = icmp->getPredicate();
+          if (pred == ICmpInst::ICMP_EQ || pred == ICmpInst::ICMP_NE) {
+            usbModel[offset].insertValue(val);
+            DEBUG("USB constraint: buf[" << offset << "] == 0x"
+                  << llvm::Twine::utohexstr(val).str());
+          } else if (pred == ICmpInst::ICMP_ULT || pred == ICmpInst::ICMP_SLT ||
+                     pred == ICmpInst::ICMP_ULE || pred == ICmpInst::ICMP_SLE) {
+            usbModel[offset].insertRanges(0, val);
+          } else if (pred == ICmpInst::ICMP_UGT || pred == ICmpInst::ICMP_SGT ||
+                     pred == ICmpInst::ICMP_UGE || pred == ICmpInst::ICMP_SGE) {
+            usbModel[offset].insertRanges(val, 0xFF);
+          }
+        }
+      }
+
+      // Also look for switch instructions - common in protocol parsing
+      if (auto *sw = dyn_cast<SwitchInst>(&I)) {
+        Value *cond = sw->getCondition()->stripPointerCasts();
+        if (auto *cast = dyn_cast<CastInst>(cond))
+          cond = cast->getOperand(0);
+
+        int offset = -1;
+        if (usbBufferReads.count(cond)) {
+          offset = usbBufferReads[cond];
+        } else if (auto *load = dyn_cast<LoadInst>(cond)) {
+          Value *addr = load->getPointerOperand()->stripPointerCasts();
+          if (auto *gep = dyn_cast<GetElementPtrInst>(addr)) {
+            offset = getGEPOffset(gep);
+          }
+        }
+
+        if (offset >= 0) {
+          int nbytes = sw->getCondition()->getType()->getScalarSizeInBits() / 8;
+          if (nbytes == 0) nbytes = 1;
+          if (usbModel.find(offset) == usbModel.end()) {
+            HWInput hi(offset, nbytes);
+            usbModel[offset] = hi;
+          }
+          for (auto &c : sw->cases()) {
+            uint64_t val = c.getCaseValue()->getZExtValue();
+            usbModel[offset].insertValue(val);
+            DEBUG("USB switch constraint: buf[" << offset << "] == 0x"
+                  << llvm::Twine::utohexstr(val).str());
+          }
+        }
+      }
+    }
+  }
+}
+
+void APStage2::extractUSBBufferConstraints() {
+  if (usbCompletionHandlers.empty()) {
+    return;
+  }
+  errs() << "========Extracting USB Buffer Constraints==========\n";
+  for (auto *handler : usbCompletionHandlers) {
+    errs() << "Analyzing: " << handler->getName().str() << "\n";
+    collectUSBBufferReads(handler);
+  }
+
+  // Also analyze functions called by completion handlers (e.g., process_data)
+  // Follow up to 3 levels of call depth
+  std::set<Function*> analyzed;
+  std::vector<Function*> worklist(usbCompletionHandlers.begin(), usbCompletionHandlers.end());
+  int depth = 0;
+  while (!worklist.empty() && depth < 3) {
+    std::vector<Function*> next_worklist;
+    for (auto *fn : worklist) {
+      for (auto &BB : *fn) {
+        for (auto &I : BB) {
+          if (auto *ci = dyn_cast<CallInst>(&I)) {
+            Function *callee = getCalledFunction(ci);
+            if (callee && !callee->isDeclaration() && !analyzed.count(callee)) {
+              errs() << "  Analyzing callee (depth " << depth+1 << "): "
+                     << callee->getName().str() << "\n";
+              collectUSBBufferReads(callee);
+              analyzed.insert(callee);
+              next_worklist.push_back(callee);
+            }
+          }
+        }
+      }
+    }
+    worklist = next_worklist;
+    depth++;
+  }
+
+  errs() << "USB model entries: " << usbModel.size() << "\n";
+  for (auto &p : usbModel) {
+    errs() << "  offset " << p.first << ": " << p.second.nbytes()
+           << " bytes, " << p.second.numConstraints() << " constraints\n";
+  }
 }
 
 bool APStage2::APStage2Pass(Module &module) {
@@ -2042,6 +2286,10 @@ bool APStage2::APStage2Pass(Module &module) {
     TypeOffset & type_offset = pair.second;
     extractDMAFieldConstraint(dma_val, type_offset);
   }
+  // USB buffer analysis
+  errs() << "=========USB Buffer Analysis============\n";
+  findUSBCompletionHandlers();
+  extractUSBBufferConstraints();
   errs() << "=========Stage2 Model Init Code============\n";
   genStage2ModelInitCode("XXX");
   genSecondaryDMAInitCode();

@@ -1,1 +1,38 @@
-__pycache__
+# Build artifacts
+build-qemu-exp/
+s2e/build/
+s2e/images/
+s2e/install/
+afl-proxy/proxy/build/
+afl-proxy/aplib/*.o
+afl-proxy/stage2/build/
+
+# Experiment data
+run-*/
+share-*/
+gcov-reports/
+
+# Coverage plots and data
+coverage-*.png
+coverage-*.jsonl
+*.gcda
+*.gcov
+*.gcno
+
+# Guest images and kernel builds
+images/
+linux/
+analysis/
+
+# Runtime artifacts
+vm-testing-*.log
+vm-testing-*.pid
+afl.log
+dry_run_stamp*
+core
+*.pid
+
+# Misc
+.bashrc
+__pycache__/
+*.pyc

@@ -219,6 +219,17 @@ private:
   std::unordered_map<Function*, int> funcIOReadCnt;
   std::unordered_map<Type*, std::set<Function*>> type2Funcs;
   std::unordered_map<Value*, int> dmaPhyAddrToDMASz;
+  // USB buffer analysis
+  std::vector<CallInst *> callUsbSubmitUrb;
+  std::vector<CallInst *> callUsbBulkMsg;
+  std::vector<CallInst *> callUsbFillUrb;
+  std::set<Function*> usbCompletionHandlers;
+  // USB buffer reads: Value -> offset in URB transfer buffer
+  std::unordered_map<Value*, int> usbBufferReads;
+  std::unordered_map<int, HWInput> usbModel;  // offset -> constraints
+  void findUSBCompletionHandlers();
+  void extractUSBBufferConstraints();
+  void collectUSBBufferReads(Function *completion_handler);
   bool enable_type_based_func_res;
   void identifyKMI(Module &module);
   void identifyKMIByStore(StoreInst *st);
