@@ -168,7 +168,7 @@ guest-tools-win-install: stamps/guest-tools32-win-install stamps/guest-tools64-w
 
 install: all-release stamps/libs2e-release-install stamps/tools-release-install \
     stamps/libvmi-release-install guest-tools-install     \
-    guest-tools-win-install stamps/llvm-release-install
+    stamps/llvm-release-install
 install-debug: all-debug stamps/libs2e-debug-install stamps/tools-debug-install \
     stamps/libvmi-debug-install guest-tools-install       \
     guest-tools-win-install stamps/llvm-release-install
@@ -852,5 +852,5 @@ guest-tools64-windrv:
 stamps/guest-tools%-win-install: stamps/guest-tools%-win-make guest-tools32-windrv guest-tools64-windrv
 	$(MAKE) -C guest-tools$*-win install
 
-stamps/guest-tools%-install: stamps/guest-tools%-make guest-tools32-windrv guest-tools64-windrv
+stamps/guest-tools%-install: stamps/guest-tools%-make
 	$(MAKE) -C guest-tools$* install

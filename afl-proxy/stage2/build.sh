@@ -14,7 +14,7 @@ function build
     mkdir build
     pushd build
     cmake ../ \
-        -DLLVM_CMAKE_PATH=/opt/toolchain/main/lib/cmake \
+        -DLLVM_CMAKE_PATH=/usr/lib/llvm-13/lib/cmake \
         -DCMAKE_BUILD_TYPE=Debug \
 
     make -j${JOBS}
